@@ -30,6 +30,35 @@ fn parts_text(parts: &[Value]) -> String {
         .join("")
 }
 
+/// A Gemini media part -> the OpenAI content-part that carries the same bytes.
+///
+/// Gemini inlines media as base64 (`inlineData`) or references it by URI
+/// (`fileData`); OpenAI takes a URL, and a `data:` URL covers both. vLLM keys
+/// the part type off the modality, so the mime type decides between
+/// `image_url` and `audio_url` — sending audio as `image_url` is rejected by
+/// the server rather than silently ignored.
+fn media_part(part: &Value) -> Option<Value> {
+    let (mime, url) = if let Some(inline) = part.get("inlineData") {
+        let mime = inline.get("mimeType").and_then(Value::as_str).unwrap_or("application/octet-stream");
+        let data = inline.get("data").and_then(Value::as_str)?;
+        (mime.to_string(), format!("data:{mime};base64,{data}"))
+    } else if let Some(file) = part.get("fileData") {
+        let mime = file.get("mimeType").and_then(Value::as_str).unwrap_or("");
+        let uri = file.get("fileUri").and_then(Value::as_str)?;
+        (mime.to_string(), uri.to_string())
+    } else {
+        return None;
+    };
+
+    Some(if mime.starts_with("audio/") {
+        json!({"type": "audio_url", "audio_url": {"url": url}})
+    } else if mime.starts_with("video/") {
+        json!({"type": "video_url", "video_url": {"url": url}})
+    } else {
+        json!({"type": "image_url", "image_url": {"url": url}})
+    })
+}
+
 /// Gemini `GenerateContentRequest` -> OpenAI `/v1/chat/completions` body.
 pub fn request_to_openai(model: &str, req: &Value, stream: bool) -> Value {
     let mut messages: Vec<Value> = Vec::new();
@@ -64,8 +93,12 @@ pub fn request_to_openai(model: &str, req: &Value, stream: bool) -> Value {
         // cannot ride along inside an assistant or user turn.
         let mut tool_msgs: Vec<Value> = Vec::new();
         let mut tool_calls: Vec<Value> = Vec::new();
+        let mut media: Vec<Value> = Vec::new();
 
         for part in parts {
+            if let Some(m) = media_part(part) {
+                media.push(m);
+            }
             if let Some(fr) = part.get("functionResponse") {
                 let name = fr.get("name").and_then(Value::as_str).unwrap_or("");
                 let response = fr.get("response").cloned().unwrap_or(Value::Null);
@@ -102,6 +135,15 @@ pub fn request_to_openai(model: &str, req: &Value, stream: bool) -> Value {
             );
             msg.insert("tool_calls".into(), json!(tool_calls));
             messages.push(Value::Object(msg));
+        } else if !media.is_empty() {
+            // With attachments, `content` must be an array of typed parts; a
+            // bare string has nowhere to put the image.
+            let mut content: Vec<Value> = Vec::new();
+            if !text.is_empty() {
+                content.push(json!({"type": "text", "text": text}));
+            }
+            content.extend(media);
+            messages.push(json!({"role": role_to_openai(role), "content": content}));
         } else if !text.is_empty() {
             messages.push(json!({"role": role_to_openai(role), "content": text}));
         }
@@ -538,6 +580,44 @@ mod tests {
     fn empty_role_only_chunk_is_dropped() {
         let chunk = json!({"choices": [{"delta": {"role": "assistant"}}]});
         assert!(chunk_to_gemini(&chunk).is_none());
+    }
+
+    #[test]
+    fn inline_image_becomes_a_data_url_part() {
+        let req = json!({"contents": [{"role": "user", "parts": [
+            {"text": "what is this?"},
+            {"inlineData": {"mimeType": "image/png", "data": "iVBORw0KGgo="}}]}]});
+        let out = request_to_openai("m", &req, false);
+        let content = &out["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn audio_routes_to_audio_url_not_image_url() {
+        let req = json!({"contents": [{"role": "user", "parts": [
+            {"inlineData": {"mimeType": "audio/wav", "data": "UklGRg=="}}]}]});
+        let out = request_to_openai("m", &req, false);
+        assert_eq!(out["messages"][0]["content"][0]["type"], "audio_url");
+    }
+
+    #[test]
+    fn file_uri_is_passed_through_as_a_url() {
+        let req = json!({"contents": [{"role": "user", "parts": [
+            {"fileData": {"mimeType": "image/jpeg", "fileUri": "https://x/y.jpg"}}]}]});
+        let out = request_to_openai("m", &req, false);
+        assert_eq!(out["messages"][0]["content"][0]["image_url"]["url"], "https://x/y.jpg");
+    }
+
+    #[test]
+    fn text_only_turn_keeps_the_plain_string_form() {
+        // vLLM accepts both, but the string form is what every other client
+        // sends; changing it for every request would be a needless behaviour
+        // change with its own failure modes.
+        let req = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
+        let out = request_to_openai("m", &req, false);
+        assert_eq!(out["messages"][0]["content"], "hi");
     }
 
     #[test]
