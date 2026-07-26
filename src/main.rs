@@ -12,6 +12,34 @@
 //!
 //! Only the routes the CLI actually calls are implemented; anything else
 //! returns 404 with a clear message rather than a confusing empty body.
+//!
+//! # Serving the CLI's own router
+//!
+//! Gemini CLI can put its routing classifier on a local model instead of
+//! spending a full-size call on it every turn. Upstream that means installing
+//! Google's LiteRT-LM binary and a Gemma 3 1B, but its client is just the GenAI
+//! SDK pointed at a base URL:
+//!
+//!     new GoogleGenAI({ apiVersion: "v1beta", httpOptions: { baseUrl: host } })
+//!         .models.generateContent({ model, contents, config: {
+//!             responseMimeType: "application/json", temperature: 0,
+//!             maxOutputTokens: 256 } })
+//!
+//! which is this gateway's wire format exactly, so no LiteRT install is needed:
+//!
+//!     "experimental": { "gemmaModelRouter": {
+//!         "enabled": true,
+//!         "autoStartServer": false,
+//!         "classifier": { "host": "http://127.0.0.1:8899",
+//!                         "model": "gemma3-1b-gpu-custom" } } }
+//!
+//! Three things there are load-bearing. `autoStartServer` defaults to true and
+//! will try to launch a LiteRT binary that is not present. The model name is
+//! checked against a hard-coded literal ("Only gemma3-1b-gpu-custom has been
+//! tested"), so it has to be spelled that way — harmless, because `--model`
+//! pins what is actually served and the requested name is discarded. And the
+//! client JSON.parses the reply under a 10s timeout, so whatever sits behind
+//! the gateway has to be quick and has to honour response_format.
 
 mod translate;
 
