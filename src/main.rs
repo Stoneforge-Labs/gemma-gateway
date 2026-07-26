@@ -60,15 +60,59 @@ use std::sync::Arc;
 struct Gateway {
     upstream: String,
     model: Option<String>,
+    /// Whatever vLLM turned out to be serving, remembered after the first ask.
+    discovered: Arc<tokio::sync::RwLock<Option<String>>>,
     http: reqwest::Client,
 }
 
 impl Gateway {
-    /// The model the CLI asked for, unless we were told to pin one. A pin is
-    /// useful because the CLI's model names ("gemini-2.5-pro") mean nothing to
-    /// vLLM, which serves exactly one.
-    fn resolve_model(&self, requested: &str) -> String {
-        self.model.clone().unwrap_or_else(|| requested.to_string())
+    /// Which model to actually ask for.
+    ///
+    /// The CLI sends names like "gemini-2.5-pro" that mean nothing to vLLM, so
+    /// something has to substitute a real one. An explicit `--model` wins, but
+    /// pinning it is a trap in daily use: `gemma --boot` serves a name that
+    /// follows the profile, so switching from quality to fast renames the model
+    /// under a gateway that is still pinned to the old one, and every request
+    /// 404s until someone restarts it.
+    ///
+    /// So with no pin, ask vLLM what it is serving and remember the answer.
+    async fn resolve_model(&self, requested: &str) -> String {
+        if let Some(pinned) = &self.model {
+            return pinned.clone();
+        }
+        if let Some(known) = self.discovered.read().await.clone() {
+            return known;
+        }
+        match self.first_served().await {
+            Some(name) => {
+                tracing::info!("upstream is serving {name}");
+                *self.discovered.write().await = Some(name.clone());
+                name
+            }
+            // Nothing to discover — pass the request through and let the
+            // upstream error say so, rather than inventing a name.
+            None => requested.to_string(),
+        }
+    }
+
+    async fn first_served(&self) -> Option<String> {
+        let url = format!("{}/models", self.upstream.trim_end_matches('/'));
+        let body = self.http.get(&url).send().await.ok()?.json::<Value>().await.ok()?;
+        body.get("data")?
+            .as_array()?
+            .first()?
+            .get("id")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// Forget the discovered name so the next request looks it up again. Called
+    /// when upstream rejects a request: the usual cause is that the server was
+    /// restarted onto a different profile.
+    async fn forget_model(&self) {
+        if self.model.is_none() {
+            *self.discovered.write().await = None;
+        }
     }
 }
 
@@ -88,7 +132,7 @@ async fn model_action(
         Some((m, a)) => (m.to_string(), a.to_string()),
         None => (spec.clone(), "generateContent".to_string()),
     };
-    let model = gw.resolve_model(&model);
+    let model = gw.resolve_model(&model).await;
 
     match action.as_str() {
         "countTokens" => count_tokens(gw, model, body).await,
@@ -117,6 +161,8 @@ async fn generate(gw: Arc<Gateway>, model: String, body: Value) -> Response {
             Ok(v) => {
                 if v.get("error").is_some() {
                     tracing::warn!(error = %v, "upstream returned an error");
+                    // Most often "model not found" after a profile switch.
+                    gw.forget_model().await;
                     return (StatusCode::BAD_GATEWAY, Json(v)).into_response();
                 }
                 Json(translate::response_to_gemini(&v)).into_response()
@@ -278,6 +324,8 @@ async fn main() {
             "--help" | "-h" => {
                 println!(
                     "gemma-gateway --listen {listen} --upstream {upstream} [--model NAME]\n\n\
+                     Without --model, the gateway asks the upstream what it is\n\
+                     serving and follows it across profile switches.\n\n\
                      Then: GOOGLE_GEMINI_BASE_URL=http://{listen} gemini"
                 );
                 return;
@@ -289,6 +337,7 @@ async fn main() {
     let gw = Arc::new(Gateway {
         upstream: upstream.clone(),
         model: model.clone(),
+        discovered: Arc::new(tokio::sync::RwLock::new(None)),
         http: reqwest::Client::builder()
             // Long, because a local reasoning model can think for minutes and a
             // premature client timeout looks exactly like a hung server.
