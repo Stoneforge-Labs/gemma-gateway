@@ -80,7 +80,9 @@ async fn model_action(
 }
 
 async fn generate(gw: Arc<Gateway>, model: String, body: Value) -> Response {
+    tracing::debug!(gemini = %body, "inbound");
     let payload = translate::request_to_openai(&model, &body, false);
+    tracing::debug!(openai = %payload, "outbound");
     let url = format!("{}/chat/completions", gw.upstream.trim_end_matches('/'));
     match gw.http.post(&url).json(&payload).send().await {
         Ok(resp) => match resp.json::<Value>().await {
@@ -98,7 +100,9 @@ async fn generate(gw: Arc<Gateway>, model: String, body: Value) -> Response {
 }
 
 async fn stream_generate(gw: Arc<Gateway>, model: String, body: Value, _sse: bool) -> Response {
+    tracing::debug!(gemini = %body, "inbound (stream)");
     let payload = translate::request_to_openai(&model, &body, true);
+    tracing::debug!(openai = %payload, "outbound (stream)");
     let url = format!("{}/chat/completions", gw.upstream.trim_end_matches('/'));
 
     let resp = match gw.http.post(&url).json(&payload).send().await {

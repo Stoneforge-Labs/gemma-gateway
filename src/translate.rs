@@ -30,6 +30,60 @@ fn parts_text(parts: &[Value]) -> String {
         .join("")
 }
 
+/// Gemini's `responseSchema` is OpenAPI, not JSON Schema: its type names are
+/// upper-case (`OBJECT`, `STRING`) and it carries fields JSON Schema has never
+/// heard of. vLLM compiles the schema into a decoding grammar and rejects the
+/// OpenAPI spelling outright:
+///
+///     {"code": 400, "message": "Grammar error: Invalid type: OBJECT"}
+///
+/// which is what broke Gemini CLI's model router -- it asks for a classification
+/// as structured output, got a 400 five times, and fell through to a default.
+fn openapi_to_json_schema(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (key, value) in map {
+                match key.as_str() {
+                    // Gemini-only hints with no JSON Schema equivalent. Passing
+                    // them through is what makes a strict validator refuse the
+                    // whole schema.
+                    "propertyOrdering" | "titleProperty" | "example" => continue,
+                    "type" => {
+                        let converted = match value {
+                            Value::String(t) => json!(t.to_ascii_lowercase()),
+                            // OpenAPI allows a list of types; lower-case each.
+                            Value::Array(ts) => json!(ts
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_ascii_lowercase)
+                                .collect::<Vec<_>>()),
+                            other => other.clone(),
+                        };
+                        out.insert("type".into(), converted);
+                    }
+                    // Handled after the loop: keys arrive sorted, so `nullable`
+                    // is seen before `type` exists to be widened.
+                    "nullable" => {}
+                    _ => {
+                        out.insert(key.clone(), openapi_to_json_schema(value));
+                    }
+                }
+            }
+            // `nullable: true` is OpenAPI's way of saying the type is a union
+            // with null; JSON Schema spells that inside `type`.
+            if map.get("nullable").and_then(Value::as_bool) == Some(true) {
+                if let Some(Value::String(t)) = out.get("type").cloned() {
+                    out.insert("type".into(), json!([t, "null"]));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(openapi_to_json_schema).collect()),
+        other => other.clone(),
+    }
+}
+
 /// A Gemini media part -> the OpenAI content-part that carries the same bytes.
 ///
 /// Gemini inlines media as base64 (`inlineData`) or references it by URI
@@ -181,7 +235,16 @@ pub fn request_to_openai(model: &str, req: &Value, stream: bool) -> Value {
             .and_then(Value::as_str)
             .map(|m| m.contains("json"))
             .unwrap_or(false);
-        let schema = cfg.get("responseJsonSchema").or_else(|| cfg.get("responseSchema"));
+        // Both fields get converted. `responseJsonSchema` sounds like it is
+        // already JSON Schema and the name is a lie: Gemini CLI's model router
+        // sends `{"type": "OBJECT", "properties": {"x": {"type": "STRING"}}}`
+        // under exactly that key. Conversion is idempotent on a real JSON
+        // Schema -- lower-casing "object" yields "object" -- so running it on
+        // both is safe and avoids trusting the field name.
+        let schema = cfg
+            .get("responseJsonSchema")
+            .or_else(|| cfg.get("responseSchema"))
+            .map(openapi_to_json_schema);
         if let Some(schema) = schema {
             body.insert(
                 "response_format".into(),
@@ -657,6 +720,75 @@ mod tests {
     fn empty_role_only_chunk_is_dropped() {
         let chunk = json!({"choices": [{"delta": {"role": "assistant"}}]});
         assert!(chunk_to_gemini(&chunk).is_none());
+    }
+
+    #[test]
+    fn openapi_response_schema_is_lowercased_for_the_grammar() {
+        // Verbatim shape of what Gemini CLI's model router sends.
+        let req = json!({"contents": [], "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "reasoning": {"type": "STRING"},
+                    "complexity": {"type": "NUMBER"},
+                    "tags": {"type": "ARRAY", "items": {"type": "STRING"}}
+                },
+                "propertyOrdering": ["reasoning", "complexity"],
+                "required": ["reasoning"]
+            }}});
+        let schema = &request_to_openai("m", &req, false)["response_format"]["json_schema"]["schema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["reasoning"]["type"], "string");
+        assert_eq!(schema["properties"]["complexity"]["type"], "number");
+        assert_eq!(schema["properties"]["tags"]["type"], "array");
+        assert_eq!(schema["properties"]["tags"]["items"]["type"], "string");
+        assert!(schema.get("propertyOrdering").is_none(), "Gemini-only key leaked through");
+        // `required` is real JSON Schema and must survive untouched.
+        assert_eq!(schema["required"], json!(["reasoning"]));
+    }
+
+    #[test]
+    fn nullable_becomes_a_type_union() {
+        let req = json!({"contents": [], "generationConfig": {"responseSchema":
+            {"type": "STRING", "nullable": true}}});
+        let schema = &request_to_openai("m", &req, false)["response_format"]["json_schema"]["schema"];
+        assert_eq!(schema["type"], json!(["string", "null"]));
+    }
+
+    #[test]
+    fn a_real_json_schema_survives_conversion_unchanged() {
+        // Conversion runs on responseJsonSchema too, so it must be idempotent.
+        let req = json!({"contents": [], "generationConfig": {"responseJsonSchema":
+            {"type": "object", "properties": {"a": {"type": "string"}},
+             "required": ["a"]}}});
+        let schema = &request_to_openai("m", &req, false)["response_format"]["json_schema"]["schema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["a"]["type"], "string");
+        assert_eq!(schema["required"], json!(["a"]));
+    }
+
+    #[test]
+    fn the_cli_router_schema_compiles() {
+        // Verbatim from Gemini CLI's NumericalClassifierStrategy, captured off
+        // the wire. Note the upper-case types under `responseJsonSchema`.
+        let req = json!({"contents": [], "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseJsonSchema": {
+                "properties": {
+                    "complexity_reasoning": {"description": "Brief explanation for the score.",
+                                             "type": "STRING"},
+                    "complexity_score": {"description": "Complexity score from 1-100.",
+                                         "type": "INTEGER"}},
+                "required": ["complexity_reasoning", "complexity_score"],
+                "type": "OBJECT"}}});
+        let schema = &request_to_openai("m", &req, false)["response_format"]["json_schema"]["schema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["complexity_score"]["type"], "integer");
+        assert_eq!(schema["properties"]["complexity_reasoning"]["type"], "string");
+        // Descriptions are legal JSON Schema and help the grammar; keep them.
+        assert_eq!(schema["properties"]["complexity_score"]["description"],
+                   "Complexity score from 1-100.");
     }
 
     #[test]
