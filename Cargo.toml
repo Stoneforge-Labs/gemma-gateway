@@ -1,0 +1,17 @@
+[package]
+name = "gemma-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "Speaks the Gemini REST API on the front, OpenAI on the back. Lets Gemini CLI drive a local vLLM-served Gemma with no changes to the CLI itself."
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+async-stream = "0.3"
+tokio-stream = "0.1"
