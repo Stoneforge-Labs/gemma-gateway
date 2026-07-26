@@ -1,5 +1,8 @@
-import json, urllib.request
-G = "http://127.0.0.1:8899/v1beta/models/gemma-4-12b"
+import json, os, urllib.request
+
+BASE = os.environ.get("GEMINI_BASE_URL", "http://127.0.0.1:8899").rstrip("/")
+MODEL = os.environ.get("GEMINI_MODEL", "gemma-4-12b")
+G = f"{BASE}/v1beta/models/{MODEL}"
 
 def post(action, body, stream=False):
     url = f"{G}:{action}" + ("?alt=sse" if stream else "")

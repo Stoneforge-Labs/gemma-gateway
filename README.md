@@ -1,42 +1,90 @@
-# gemma-gateway
+# Gemma Gateway
 
-Speaks the **Gemini REST API** at the front and **OpenAI chat-completions** at the
-back, so Gemini CLI can drive a local vLLM-served Gemma.
+Run the upstream [Gemini CLI](https://github.com/google-gemini/gemini-cli)
+against a local model served by vLLM. The CLI is not forked or patched.
 
-    gemma-gateway --listen 127.0.0.1:8899 --upstream http://127.0.0.1:8891/v1 --model gemma-4-26b-a4b
-    GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8899 gemini
+```text
+Gemini CLI ── Gemini REST ──▶ gemma-gateway ── OpenAI chat ──▶ vLLM ──▶ Gemma
+```
 
-## Why a proxy instead of a fork
+## Quick start
 
-Gemini CLI honours `GOOGLE_GEMINI_BASE_URL` and has a matching `AuthType::GATEWAY`,
-so **no CLI source is modified.** The fork stays byte-identical to upstream:
-`git pull` keeps working, and every feature Google ships — hooks, MCP, subagents,
-checkpointing, plan mode, sandboxing — arrives for free instead of being ported
-one at a time.
+Requirements: Rust, Gemini CLI, and an OpenAI-compatible vLLM server.
 
-Google never merged local-model support (eight closed community PRs for Ollama,
-LM Studio, LocalAI and custom base URLs), but Apache-2.0 means the extension
-point is still there to use.
+```bash
+cargo build --release
 
-## The three translations that matter
+./target/release/gemma-gateway \
+  --listen 127.0.0.1:8899 \
+  --upstream http://127.0.0.1:8891/v1
 
-Everything else is mechanical. These are the ones with teeth:
+GEMINI_API_KEY=local \
+GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8899 \
+gemini
+```
 
-| | Gemini | OpenAI |
-|---|---|---|
-| structure | `contents[].parts[]` | flat `messages[]` |
-| tool call | a `functionCall` **part** | `tool_calls[]` with **JSON-string** arguments |
-| reasoning | a part with `thought: true` | `delta.reasoning_content` |
+Without `--model`, the gateway reads vLLM's `/models` endpoint and follows model
+changes. Use `--model NAME` only to pin a fixed upstream.
 
-The third one is a trap: a thinking model streams its first tokens into
-`reasoning_content`, not `content`. Waiting only on `content` makes a working
-model look hung — the same bug bit the benchmark harness on this rig.
+Gemini CLI also needs API-key auth selected in `~/.gemini/settings.json`:
 
-## Status
+```json
+{
+  "security": {
+    "auth": {
+      "selectedType": "gemini-api-key"
+    }
+  }
+}
+```
 
-15 translation unit tests, plus verified end-to-end against a live Gemma:
-non-streaming, SSE streaming, `countTokens` (real counts via vLLM `/tokenize`),
-and model listing.
+## What it translates
 
-Not yet exercised: multi-turn tool-call round-trips under a real agent loop, and
-images. Both are expected to need iteration.
+| Gemini API | Local OpenAI/vLLM |
+|---|---|
+| `contents[].parts[]` and system instructions | chat-completion messages |
+| function declarations, calls, and responses | tools and tool messages |
+| fragmented streamed function calls | complete tool calls with JSON arguments |
+| `thought: true` parts | `reasoning_content` |
+| JSON/OpenAPI response schemas | vLLM structured output |
+| `toolConfig` modes | `tool_choice` |
+| streamed usage metadata | `stream_options.include_usage` |
+| inline and file media parts | OpenAI image, audio, and video parts |
+| `countTokens` | vLLM `/tokenize`, with a documented estimate fallback |
+| Gemini model listing | vLLM `/models` |
+
+The gateway implements `generateContent`, `streamGenerateContent`, `countTokens`,
+and model listing on both `/v1` and `/v1beta`.
+
+## Why this shape
+
+`GOOGLE_GEMINI_BASE_URL` redirects Gemini CLI's inference requests to the local
+gateway. The CLI stays upstream-compatible, while the gateway owns the protocol
+differences that otherwise break tools, reasoning, structured output, and token
+accounting.
+
+This replaces the inference path, not the CLI. MCP tools and other integrations
+may still use their own network connections.
+
+## Verification
+
+```bash
+cargo test
+
+# With the gateway and vLLM running:
+GEMINI_MODEL=gemma-4-26b-a4b python3 verify_live.py
+```
+
+The repository has 31 translation tests. `verify_live.py` checks structured
+JSON, tool suppression, and streamed token usage against a live model.
+
+## Security
+
+The gateway does not implement authentication. Keep it and vLLM bound to
+`127.0.0.1`; do not expose either port to an untrusted network. `GEMINI_API_KEY`
+is a placeholder required by the client SDK and is not validated by the
+gateway.
+
+## License
+
+MIT

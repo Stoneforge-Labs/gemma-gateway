@@ -3,6 +3,9 @@ name = "gemma-gateway"
 version = "0.1.0"
 edition = "2021"
 description = "Speaks the Gemini REST API on the front, OpenAI on the back. Lets Gemini CLI drive a local vLLM-served Gemma with no changes to the CLI itself."
+license = "MIT"
+repository = "https://github.com/Stoneforge-Labs/gemma-gateway"
+readme = "README.md"
 
 [dependencies]
 axum = "0.7"

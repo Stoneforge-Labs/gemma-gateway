@@ -97,7 +97,15 @@ impl Gateway {
 
     async fn first_served(&self) -> Option<String> {
         let url = format!("{}/models", self.upstream.trim_end_matches('/'));
-        let body = self.http.get(&url).send().await.ok()?.json::<Value>().await.ok()?;
+        let body = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .ok()?
+            .json::<Value>()
+            .await
+            .ok()?;
         body.get("data")?
             .as_array()?
             .first()?

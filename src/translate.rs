@@ -93,7 +93,10 @@ fn openapi_to_json_schema(schema: &Value) -> Value {
 /// the server rather than silently ignored.
 fn media_part(part: &Value) -> Option<Value> {
     let (mime, url) = if let Some(inline) = part.get("inlineData") {
-        let mime = inline.get("mimeType").and_then(Value::as_str).unwrap_or("application/octet-stream");
+        let mime = inline
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .unwrap_or("application/octet-stream");
         let data = inline.get("data").and_then(Value::as_str)?;
         (mime.to_string(), format!("data:{mime};base64,{data}"))
     } else if let Some(file) = part.get("fileData") {
@@ -136,7 +139,10 @@ pub fn request_to_openai(model: &str, req: &Value, stream: bool) -> Value {
         .map(Vec::as_slice)
         .unwrap_or(&[])
     {
-        let role = content.get("role").and_then(Value::as_str).unwrap_or("user");
+        let role = content
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
         let empty = Vec::new();
         let parts = content
             .get("parts")
@@ -185,7 +191,11 @@ pub fn request_to_openai(model: &str, req: &Value, stream: bool) -> Value {
             msg.insert("role".into(), json!("assistant"));
             msg.insert(
                 "content".into(),
-                if text.is_empty() { Value::Null } else { json!(text) },
+                if text.is_empty() {
+                    Value::Null
+                } else {
+                    json!(text)
+                },
             );
             msg.insert("tool_calls".into(), json!(tool_calls));
             messages.push(Value::Object(msg));
@@ -445,8 +455,8 @@ impl ToolCallAccumulator {
             .drain(..)
             .filter(|(name, _)| !name.is_empty())
             .map(|(name, args)| {
-                let parsed = serde_json::from_str::<Value>(&args)
-                    .unwrap_or_else(|_| json!({"_raw": args}));
+                let parsed =
+                    serde_json::from_str::<Value>(&args).unwrap_or_else(|_| json!({"_raw": args}));
                 json!({"functionCall": {"name": name, "args": parsed}})
             })
             .collect()
@@ -457,7 +467,11 @@ impl ToolCallAccumulator {
 /// the chunk carries nothing renderable yet (role-only openers, keepalives, or
 /// a tool-call fragment still being accumulated).
 pub fn chunk_to_gemini_acc(chunk: &Value, acc: &mut ToolCallAccumulator) -> Option<Value> {
-    let choice = match chunk.get("choices").and_then(Value::as_array).and_then(|c| c.first()) {
+    let choice = match chunk
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())
+    {
         Some(c) => c,
         // With include_usage, vLLM ends the stream with a choices-less chunk
         // carrying only the token counts. Dropping it is how a finished turn
@@ -526,6 +540,7 @@ fn usage_metadata(payload: &Value) -> Option<Value> {
 }
 
 /// Stateless variant, kept for the non-accumulating tests.
+#[cfg(test)]
 pub fn chunk_to_gemini(chunk: &Value) -> Option<Value> {
     let choice = chunk
         .get("choices")
@@ -586,8 +601,6 @@ pub fn chunk_to_gemini(chunk: &Value) -> Option<Value> {
     }
     Some(Value::Object(out))
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -688,7 +701,10 @@ mod tests {
     fn length_finish_becomes_max_tokens() {
         let resp = json!({"choices": [{"message": {"content": "x"},
                                        "finish_reason": "length"}]});
-        assert_eq!(response_to_gemini(&resp)["candidates"][0]["finishReason"], "MAX_TOKENS");
+        assert_eq!(
+            response_to_gemini(&resp)["candidates"][0]["finishReason"],
+            "MAX_TOKENS"
+        );
     }
 
     #[test]
@@ -726,24 +742,28 @@ mod tests {
     fn openapi_response_schema_is_lowercased_for_the_grammar() {
         // Verbatim shape of what Gemini CLI's model router sends.
         let req = json!({"contents": [], "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": {
-                "type": "OBJECT",
-                "properties": {
-                    "reasoning": {"type": "STRING"},
-                    "complexity": {"type": "NUMBER"},
-                    "tags": {"type": "ARRAY", "items": {"type": "STRING"}}
-                },
-                "propertyOrdering": ["reasoning", "complexity"],
-                "required": ["reasoning"]
-            }}});
-        let schema = &request_to_openai("m", &req, false)["response_format"]["json_schema"]["schema"];
+        "responseMimeType": "application/json",
+        "responseSchema": {
+            "type": "OBJECT",
+            "properties": {
+                "reasoning": {"type": "STRING"},
+                "complexity": {"type": "NUMBER"},
+                "tags": {"type": "ARRAY", "items": {"type": "STRING"}}
+            },
+            "propertyOrdering": ["reasoning", "complexity"],
+            "required": ["reasoning"]
+        }}});
+        let schema =
+            &request_to_openai("m", &req, false)["response_format"]["json_schema"]["schema"];
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["reasoning"]["type"], "string");
         assert_eq!(schema["properties"]["complexity"]["type"], "number");
         assert_eq!(schema["properties"]["tags"]["type"], "array");
         assert_eq!(schema["properties"]["tags"]["items"]["type"], "string");
-        assert!(schema.get("propertyOrdering").is_none(), "Gemini-only key leaked through");
+        assert!(
+            schema.get("propertyOrdering").is_none(),
+            "Gemini-only key leaked through"
+        );
         // `required` is real JSON Schema and must survive untouched.
         assert_eq!(schema["required"], json!(["reasoning"]));
     }
@@ -752,7 +772,8 @@ mod tests {
     fn nullable_becomes_a_type_union() {
         let req = json!({"contents": [], "generationConfig": {"responseSchema":
             {"type": "STRING", "nullable": true}}});
-        let schema = &request_to_openai("m", &req, false)["response_format"]["json_schema"]["schema"];
+        let schema =
+            &request_to_openai("m", &req, false)["response_format"]["json_schema"]["schema"];
         assert_eq!(schema["type"], json!(["string", "null"]));
     }
 
@@ -762,7 +783,8 @@ mod tests {
         let req = json!({"contents": [], "generationConfig": {"responseJsonSchema":
             {"type": "object", "properties": {"a": {"type": "string"}},
              "required": ["a"]}}});
-        let schema = &request_to_openai("m", &req, false)["response_format"]["json_schema"]["schema"];
+        let schema =
+            &request_to_openai("m", &req, false)["response_format"]["json_schema"]["schema"];
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["a"]["type"], "string");
         assert_eq!(schema["required"], json!(["a"]));
@@ -782,18 +804,25 @@ mod tests {
                                          "type": "INTEGER"}},
                 "required": ["complexity_reasoning", "complexity_score"],
                 "type": "OBJECT"}}});
-        let schema = &request_to_openai("m", &req, false)["response_format"]["json_schema"]["schema"];
+        let schema =
+            &request_to_openai("m", &req, false)["response_format"]["json_schema"]["schema"];
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["complexity_score"]["type"], "integer");
-        assert_eq!(schema["properties"]["complexity_reasoning"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["complexity_reasoning"]["type"],
+            "string"
+        );
         // Descriptions are legal JSON Schema and help the grammar; keep them.
-        assert_eq!(schema["properties"]["complexity_score"]["description"],
-                   "Complexity score from 1-100.");
+        assert_eq!(
+            schema["properties"]["complexity_score"]["description"],
+            "Complexity score from 1-100."
+        );
     }
 
     #[test]
     fn json_mime_type_requests_json_mode() {
-        let req = json!({"contents": [], "generationConfig": {"responseMimeType": "application/json"}});
+        let req =
+            json!({"contents": [], "generationConfig": {"responseMimeType": "application/json"}});
         let out = request_to_openai("m", &req, false);
         assert_eq!(out["response_format"]["type"], "json_object");
     }
@@ -821,7 +850,9 @@ mod tests {
     #[test]
     fn streaming_asks_for_token_counts() {
         let req = json!({"contents": []});
-        assert!(request_to_openai("m", &req, false).get("stream_options").is_none());
+        assert!(request_to_openai("m", &req, false)
+            .get("stream_options")
+            .is_none());
         let s = request_to_openai("m", &req, true);
         assert_eq!(s["stream_options"]["include_usage"], true);
     }
@@ -845,7 +876,10 @@ mod tests {
         let content = &out["messages"][0]["content"];
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[1]["type"], "image_url");
-        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,iVBORw0KGgo=");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
     }
 
     #[test]
@@ -861,7 +895,10 @@ mod tests {
         let req = json!({"contents": [{"role": "user", "parts": [
             {"fileData": {"mimeType": "image/jpeg", "fileUri": "https://x/y.jpg"}}]}]});
         let out = request_to_openai("m", &req, false);
-        assert_eq!(out["messages"][0]["content"][0]["image_url"]["url"], "https://x/y.jpg");
+        assert_eq!(
+            out["messages"][0]["content"][0]["image_url"]["url"],
+            "https://x/y.jpg"
+        );
     }
 
     #[test]
@@ -880,8 +917,10 @@ mod tests {
         let mut acc = ToolCallAccumulator::new();
         let opener = json!({"choices": [{"delta": {"tool_calls": [
             {"index": 0, "id": "c1", "function": {"name": "read_file", "arguments": ""}}]}}]});
-        assert!(chunk_to_gemini_acc(&opener, &mut acc).is_none(),
-                "a name-only fragment must not be emitted on its own");
+        assert!(
+            chunk_to_gemini_acc(&opener, &mut acc).is_none(),
+            "a name-only fragment must not be emitted on its own"
+        );
 
         for frag in ["{\"path\"", ": \"secret", ".txt\"}"] {
             let c = json!({"choices": [{"delta": {"tool_calls": [
@@ -905,7 +944,10 @@ mod tests {
         chunk_to_gemini_acc(&c, &mut acc);
         let done = json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]});
         let out = chunk_to_gemini_acc(&done, &mut acc).unwrap();
-        let parts = out["candidates"][0]["content"]["parts"].as_array().unwrap().clone();
+        let parts = out["candidates"][0]["content"]["parts"]
+            .as_array()
+            .unwrap()
+            .clone();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["functionCall"]["name"], "a");
         assert_eq!(parts[1]["functionCall"]["name"], "b");
