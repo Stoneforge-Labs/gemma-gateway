@@ -170,6 +170,55 @@ pub fn request_to_openai(model: &str, req: &Value, stream: bool) -> Value {
         if let Some(stops) = cfg.get("stopSequences") {
             body.insert("stop".into(), stops.clone());
         }
+
+        // Structured output. The CLI does not only use this for user-facing
+        // work: its next-speaker check, loop detection and chat compression all
+        // ask for JSON and parse the reply. Without a response_format the model
+        // answers in prose, JSON.parse throws, and those subsystems fail in
+        // ways that look like unrelated bugs.
+        let wants_json = cfg
+            .get("responseMimeType")
+            .and_then(Value::as_str)
+            .map(|m| m.contains("json"))
+            .unwrap_or(false);
+        let schema = cfg.get("responseJsonSchema").or_else(|| cfg.get("responseSchema"));
+        if let Some(schema) = schema {
+            body.insert(
+                "response_format".into(),
+                json!({
+                    "type": "json_schema",
+                    "json_schema": {"name": "response", "schema": schema, "strict": true}
+                }),
+            );
+        } else if wants_json {
+            body.insert("response_format".into(), json!({"type": "json_object"}));
+        }
+    }
+
+    // A streamed response carries no token counts unless asked; the CLI shows
+    // them and budgets against them, so a stream without usage reads as zero.
+    if stream {
+        body.insert("stream_options".into(), json!({"include_usage": true}));
+    }
+
+    // toolConfig decides whether the model may call a tool, must call one, or
+    // must not. Dropping it turns "must not" into "may", which is how a
+    // summarisation call comes back as a tool call instead of a summary.
+    if let Some(mode) = req
+        .get("toolConfig")
+        .and_then(|c| c.get("functionCallingConfig"))
+        .and_then(|c| c.get("mode"))
+        .and_then(Value::as_str)
+    {
+        let choice = match mode.to_ascii_uppercase().as_str() {
+            "NONE" => Some(json!("none")),
+            "ANY" => Some(json!("required")),
+            "AUTO" => Some(json!("auto")),
+            _ => None,
+        };
+        if let Some(choice) = choice {
+            body.insert("tool_choice".into(), choice);
+        }
     }
 
     // Tool declarations: Gemini groups them under tools[].functionDeclarations.
@@ -345,10 +394,13 @@ impl ToolCallAccumulator {
 /// the chunk carries nothing renderable yet (role-only openers, keepalives, or
 /// a tool-call fragment still being accumulated).
 pub fn chunk_to_gemini_acc(chunk: &Value, acc: &mut ToolCallAccumulator) -> Option<Value> {
-    let choice = chunk
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|c| c.first())?;
+    let choice = match chunk.get("choices").and_then(Value::as_array).and_then(|c| c.first()) {
+        Some(c) => c,
+        // With include_usage, vLLM ends the stream with a choices-less chunk
+        // carrying only the token counts. Dropping it is how a finished turn
+        // reports zero tokens used.
+        None => return usage_metadata(chunk).map(|u| json!({"usageMetadata": u})),
+    };
     let delta = choice.get("delta")?;
     let finish = choice.get("finish_reason").and_then(Value::as_str);
 
@@ -389,7 +441,25 @@ pub fn chunk_to_gemini_acc(chunk: &Value, acc: &mut ToolCallAccumulator) -> Opti
             }),
         );
     }
-    Some(json!({"candidates": [Value::Object(candidate)]}))
+    let mut out = Map::new();
+    out.insert("candidates".into(), json!([Value::Object(candidate)]));
+    if let Some(u) = usage_metadata(chunk) {
+        out.insert("usageMetadata".into(), u);
+    }
+    Some(Value::Object(out))
+}
+
+/// OpenAI `usage` -> Gemini `usageMetadata`, when the payload carries one.
+fn usage_metadata(payload: &Value) -> Option<Value> {
+    let usage = payload.get("usage")?;
+    if usage.is_null() {
+        return None;
+    }
+    Some(json!({
+        "promptTokenCount": usage.get("prompt_tokens").cloned().unwrap_or(json!(0)),
+        "candidatesTokenCount": usage.get("completion_tokens").cloned().unwrap_or(json!(0)),
+        "totalTokenCount": usage.get("total_tokens").cloned().unwrap_or(json!(0)),
+    }))
 }
 
 /// Stateless variant, kept for the non-accumulating tests.
@@ -446,8 +516,15 @@ pub fn chunk_to_gemini(chunk: &Value) -> Option<Value> {
             }),
         );
     }
-    Some(json!({"candidates": [Value::Object(candidate)]}))
+    let mut out = Map::new();
+    out.insert("candidates".into(), json!([Value::Object(candidate)]));
+    if let Some(u) = usage_metadata(chunk) {
+        out.insert("usageMetadata".into(), u);
+    }
+    Some(Value::Object(out))
 }
+
+
 
 #[cfg(test)]
 mod tests {
@@ -580,6 +657,51 @@ mod tests {
     fn empty_role_only_chunk_is_dropped() {
         let chunk = json!({"choices": [{"delta": {"role": "assistant"}}]});
         assert!(chunk_to_gemini(&chunk).is_none());
+    }
+
+    #[test]
+    fn json_mime_type_requests_json_mode() {
+        let req = json!({"contents": [], "generationConfig": {"responseMimeType": "application/json"}});
+        let out = request_to_openai("m", &req, false);
+        assert_eq!(out["response_format"]["type"], "json_object");
+    }
+
+    #[test]
+    fn a_response_schema_becomes_guided_decoding() {
+        let schema = json!({"type": "object", "properties": {"next": {"type": "string"}}});
+        let req = json!({"contents": [], "generationConfig": {
+            "responseMimeType": "application/json", "responseJsonSchema": schema}});
+        let out = request_to_openai("m", &req, false);
+        assert_eq!(out["response_format"]["type"], "json_schema");
+        assert_eq!(out["response_format"]["json_schema"]["schema"], schema);
+    }
+
+    #[test]
+    fn tool_config_mode_maps_to_tool_choice() {
+        for (mode, expected) in [("NONE", "none"), ("ANY", "required"), ("AUTO", "auto")] {
+            let req = json!({"contents": [],
+                "toolConfig": {"functionCallingConfig": {"mode": mode}}});
+            let out = request_to_openai("m", &req, false);
+            assert_eq!(out["tool_choice"], expected, "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn streaming_asks_for_token_counts() {
+        let req = json!({"contents": []});
+        assert!(request_to_openai("m", &req, false).get("stream_options").is_none());
+        let s = request_to_openai("m", &req, true);
+        assert_eq!(s["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn usage_only_final_chunk_is_forwarded_not_dropped() {
+        let mut acc = ToolCallAccumulator::new();
+        let chunk = json!({"choices": [],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 11, "total_tokens": 18}});
+        let out = chunk_to_gemini_acc(&chunk, &mut acc).expect("usage chunk must survive");
+        assert_eq!(out["usageMetadata"]["totalTokenCount"], 18);
+        assert_eq!(out["usageMetadata"]["candidatesTokenCount"], 11);
     }
 
     #[test]
