@@ -1,1 +1,4 @@
 /target
+
+# CodeGraph index: a SQLite DB rebuilt from source, not a source artifact.
+.codegraph/
