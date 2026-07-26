@@ -97,7 +97,7 @@ async fn generate(gw: Arc<Gateway>, model: String, body: Value) -> Response {
     }
 }
 
-async fn stream_generate(gw: Arc<Gateway>, model: String, body: Value, sse: bool) -> Response {
+async fn stream_generate(gw: Arc<Gateway>, model: String, body: Value, _sse: bool) -> Response {
     let payload = translate::request_to_openai(&model, &body, true);
     let url = format!("{}/chat/completions", gw.upstream.trim_end_matches('/'));
 
@@ -112,6 +112,9 @@ async fn stream_generate(gw: Arc<Gateway>, model: String, body: Value, sse: bool
     let stream = async_stream::stream! {
         let mut bytes = resp.bytes_stream();
         let mut buf = String::new();
+        // Tool calls arrive in fragments across chunks; hold them until the
+        // model reports finish, then emit each as one whole functionCall.
+        let mut acc = translate::ToolCallAccumulator::new();
         while let Some(next) = bytes.next().await {
             let chunk = match next {
                 Ok(c) => c,
@@ -125,16 +128,19 @@ async fn stream_generate(gw: Arc<Gateway>, model: String, body: Value, sse: bool
                 let data = data.trim();
                 if data.is_empty() { continue }
                 if data == "[DONE]" {
-                    if sse { yield Ok::<_, std::io::Error>(axum::body::Bytes::from("data: [DONE]\n\n")); }
+                    // OpenAI terminates a stream with a literal [DONE] sentinel;
+                    // Google's SSE does not — it just ends. Forwarding it makes
+                    // the GenAI SDK try to JSON.parse the word "[DONE]" and
+                    // crash the turn after the answer already arrived.
                     return;
                 }
                 let Ok(parsed) = serde_json::from_str::<Value>(data) else {
                     tracing::debug!(raw = %data, "unparseable chunk, skipped");
                     continue
                 };
-                if let Some(out) = translate::chunk_to_gemini(&parsed) {
+                if let Some(out) = translate::chunk_to_gemini_acc(&parsed, &mut acc) {
                     let framed = format!("data: {out}\n\n");
-                    yield Ok(axum::body::Bytes::from(framed));
+                    yield Ok::<_, std::io::Error>(axum::body::Bytes::from(framed));
                 }
             }
         }

@@ -238,8 +238,119 @@ pub fn response_to_gemini(resp: &Value) -> Value {
     })
 }
 
+/// Accumulates tool calls across SSE chunks.
+///
+/// OpenAI streams a tool call in pieces: the first delta carries `index`, `id`
+/// and `function.name`, and later deltas append fragments of
+/// `function.arguments` with no name at all. Gemini has no equivalent — a
+/// `functionCall` part is atomic. Translating each chunk independently emitted
+/// one nameless call per fragment, which reached the CLI as `generic_tool` and
+/// made every tool call fail.
+#[derive(Default)]
+pub struct ToolCallAccumulator {
+    calls: Vec<(String, String)>, // (name, arguments-so-far), by index
+}
+
+impl ToolCallAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one delta's tool_calls in. Returns nothing — completed calls are
+    /// drained by `finish()` once the stream reports it is done.
+    fn absorb(&mut self, delta: &Value) {
+        for call in delta
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        {
+            let idx = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            while self.calls.len() <= idx {
+                self.calls.push((String::new(), String::new()));
+            }
+            let f = call.get("function");
+            if let Some(name) = f.and_then(|f| f.get("name")).and_then(Value::as_str) {
+                if !name.is_empty() {
+                    self.calls[idx].0 = name.to_string();
+                }
+            }
+            if let Some(args) = f.and_then(|f| f.get("arguments")).and_then(Value::as_str) {
+                self.calls[idx].1.push_str(args);
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+
+    /// The assembled calls as Gemini `functionCall` parts.
+    fn drain_parts(&mut self) -> Vec<Value> {
+        self.calls
+            .drain(..)
+            .filter(|(name, _)| !name.is_empty())
+            .map(|(name, args)| {
+                let parsed = serde_json::from_str::<Value>(&args)
+                    .unwrap_or_else(|_| json!({"_raw": args}));
+                json!({"functionCall": {"name": name, "args": parsed}})
+            })
+            .collect()
+    }
+}
+
 /// One OpenAI SSE `delta` chunk -> one Gemini streaming response, or None when
-/// the chunk carries nothing renderable (role-only openers, empty keepalives).
+/// the chunk carries nothing renderable yet (role-only openers, keepalives, or
+/// a tool-call fragment still being accumulated).
+pub fn chunk_to_gemini_acc(chunk: &Value, acc: &mut ToolCallAccumulator) -> Option<Value> {
+    let choice = chunk
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())?;
+    let delta = choice.get("delta")?;
+    let finish = choice.get("finish_reason").and_then(Value::as_str);
+
+    acc.absorb(delta);
+
+    let mut parts: Vec<Value> = Vec::new();
+    for key in ["reasoning_content", "reasoning"] {
+        if let Some(t) = delta.get(key).and_then(Value::as_str) {
+            if !t.is_empty() {
+                parts.push(json!({"text": t, "thought": true}));
+            }
+        }
+    }
+    if let Some(t) = delta.get("content").and_then(Value::as_str) {
+        if !t.is_empty() {
+            parts.push(json!({"text": t}));
+        }
+    }
+
+    // Only once the model is done can the accumulated calls be emitted whole.
+    if finish.is_some() && !acc.is_empty() {
+        parts.extend(acc.drain_parts());
+    }
+
+    if parts.is_empty() && finish.is_none() {
+        return None;
+    }
+
+    let mut candidate = Map::new();
+    candidate.insert("content".into(), json!({"role": "model", "parts": parts}));
+    candidate.insert("index".into(), json!(0));
+    if let Some(f) = finish {
+        candidate.insert(
+            "finishReason".into(),
+            json!(match f {
+                "length" => "MAX_TOKENS",
+                _ => "STOP",
+            }),
+        );
+    }
+    Some(json!({"candidates": [Value::Object(candidate)]}))
+}
+
+/// Stateless variant, kept for the non-accumulating tests.
 pub fn chunk_to_gemini(chunk: &Value) -> Option<Value> {
     let choice = chunk
         .get("choices")
@@ -427,6 +538,51 @@ mod tests {
     fn empty_role_only_chunk_is_dropped() {
         let chunk = json!({"choices": [{"delta": {"role": "assistant"}}]});
         assert!(chunk_to_gemini(&chunk).is_none());
+    }
+
+    #[test]
+    fn streamed_tool_call_is_assembled_from_fragments() {
+        // Exactly how vLLM streams one: name first, then arguments in pieces.
+        let mut acc = ToolCallAccumulator::new();
+        let opener = json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "c1", "function": {"name": "read_file", "arguments": ""}}]}}]});
+        assert!(chunk_to_gemini_acc(&opener, &mut acc).is_none(),
+                "a name-only fragment must not be emitted on its own");
+
+        for frag in ["{\"path\"", ": \"secret", ".txt\"}"] {
+            let c = json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": frag}}]}}]});
+            assert!(chunk_to_gemini_acc(&c, &mut acc).is_none());
+        }
+
+        let done = json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]});
+        let out = chunk_to_gemini_acc(&done, &mut acc).expect("finish emits the call");
+        let call = &out["candidates"][0]["content"]["parts"][0]["functionCall"];
+        assert_eq!(call["name"], "read_file");
+        assert_eq!(call["args"]["path"], "secret.txt");
+    }
+
+    #[test]
+    fn two_parallel_streamed_tool_calls_stay_separate() {
+        let mut acc = ToolCallAccumulator::new();
+        let c = json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"name": "a", "arguments": "{}"}},
+            {"index": 1, "function": {"name": "b", "arguments": "{}"}}]}}]});
+        chunk_to_gemini_acc(&c, &mut acc);
+        let done = json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]});
+        let out = chunk_to_gemini_acc(&done, &mut acc).unwrap();
+        let parts = out["candidates"][0]["content"]["parts"].as_array().unwrap().clone();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["functionCall"]["name"], "a");
+        assert_eq!(parts[1]["functionCall"]["name"], "b");
+    }
+
+    #[test]
+    fn streamed_text_still_flows_immediately() {
+        let mut acc = ToolCallAccumulator::new();
+        let c = json!({"choices": [{"delta": {"content": "hi"}}]});
+        let out = chunk_to_gemini_acc(&c, &mut acc).expect("text is not buffered");
+        assert_eq!(out["candidates"][0]["content"]["parts"][0]["text"], "hi");
     }
 
     #[test]
