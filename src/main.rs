@@ -319,16 +319,46 @@ async fn list_models(State(gw): State<Arc<Gateway>>) -> Response {
             Vec::new()
         }
     };
-    let models: Vec<Value> = ids
-        .iter()
-        .map(|id| {
-            json!({
-                "name": format!("models/{id}"),
-                "displayName": id,
-                "supportedGenerationMethods": ["generateContent", "streamGenerateContent", "countTokens"],
-            })
+    // Advertise the stock Gemini names alongside whatever is really loaded.
+    //
+    // The CLI's "auto" model mode does not send your turn straight to the
+    // model. It first asks a small router model -- gemini-3.1-flash-lite --
+    // which one should handle it. That name is not what vLLM is serving, so it
+    // was missing from this list, and the CLI gave up before it ever sent the
+    // request: four router calls billed at zero tokens, nothing in this
+    // gateway's log at all, and a session that just sat there. The turn had not
+    // failed, it had never started.
+    //
+    // Nothing is being faked that is not already true: resolve_model() rewrites
+    // whatever name a request carries to the model actually loaded, so a call
+    // for any of these is answered by the local Gemma. Impersonating the Gemini
+    // API is this program's entire job -- listing only one name was the
+    // inconsistency, not this.
+    const ALIASES: &[&str] = &[
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-flash",
+        "gemini-3.1-pro",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+    ];
+    let entry = |id: &str| {
+        json!({
+            "name": format!("models/{id}"),
+            "displayName": id,
+            "supportedGenerationMethods": ["generateContent", "streamGenerateContent", "countTokens"],
         })
-        .collect();
+    };
+    // Real ones first: `gem` reads models[0] to decide what to pass as -m, so a
+    // stock name at the front would pin the session to an alias and make every
+    // log say "gemini-3.1-pro" for a Gemma.
+    let mut models: Vec<Value> = ids.iter().map(|id| entry(id)).collect();
+    models.extend(
+        ALIASES
+            .iter()
+            .filter(|a| !ids.iter().any(|id| id == *a))
+            .map(|a| entry(a)),
+    );
     Json(json!({"models": models})).into_response()
 }
 
