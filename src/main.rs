@@ -46,7 +46,7 @@ mod translate;
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -178,6 +178,36 @@ async fn generate(gw: Arc<Gateway>, model: String, body: Value) -> Response {
             Err(e) => upstream_error("decoding upstream response", e),
         },
         Err(e) => upstream_error("calling upstream", e),
+    }
+}
+
+/// Keep OpenAI-compatible clients on the same ingress as Gemini clients.
+///
+/// This also terminates client-side h2c upgrades before forwarding with
+/// reqwest, which avoids Uvicorn treating an upgraded request body as empty.
+async fn openai_chat(State(gw): State<Arc<Gateway>>, Json(mut body): Json<Value>) -> Response {
+    let requested = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let model = gw.resolve_model(requested).await;
+    if let Some(object) = body.as_object_mut() {
+        object.insert("model".into(), json!(model));
+    }
+    let url = format!("{}/chat/completions", gw.upstream.trim_end_matches('/'));
+    match gw.http.post(&url).json(&body).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let content_type = resp.headers().get(CONTENT_TYPE).cloned();
+            let mut response = Response::builder().status(status);
+            if let Some(content_type) = content_type {
+                response = response.header(CONTENT_TYPE, content_type);
+            }
+            response
+                .body(Body::from_stream(resp.bytes_stream()))
+                .expect("valid upstream response")
+        }
+        Err(e) => upstream_error("calling OpenAI-compatible upstream", e),
     }
 }
 
@@ -359,6 +389,7 @@ async fn main() {
         .route("/v1beta/models/*spec", post(model_action))
         .route("/v1/models", get(list_models))
         .route("/v1/models/*spec", post(model_action))
+        .route("/v1/chat/completions", post(openai_chat))
         .route("/health", get(|| async { "ok" }))
         .with_state(gw);
 
@@ -367,4 +398,42 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("cannot bind {listen}: {e}"));
     axum::serve(listener, app).await.expect("server");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn openai_chat_forwards_json_through_the_gateway() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                Json(json!({"model": body["model"], "ok": true}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let gw = Arc::new(Gateway {
+            upstream: format!("http://{address}/v1"),
+            model: Some("served-model".into()),
+            discovered: Arc::new(tokio::sync::RwLock::new(None)),
+            http: reqwest::Client::new(),
+        });
+
+        let response = openai_chat(
+            State(gw),
+            Json(json!({"model": "requested-model", "messages": []})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"model": "served-model", "ok": true})
+        );
+        server.abort();
+    }
 }

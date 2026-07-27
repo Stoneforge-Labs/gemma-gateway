@@ -65,7 +65,8 @@ Gemini CLI also needs API-key auth selected in `~/.gemini/settings.json`:
 | Gemini model listing | vLLM `/models` |
 
 The gateway implements `generateContent`, `streamGenerateContent`, `countTokens`,
-and model listing on both `/v1` and `/v1beta`.
+and model listing on both `/v1` and `/v1beta`. OpenAI-compatible clients can
+share the same ingress through `/v1/chat/completions`.
 
 ## Why this shape
 
