@@ -88,3 +88,9 @@ gateway.
 ## License
 
 MIT
+
+## Author
+
+[Jayson Stone](https://stepdaddenergy.github.io/) ·
+[Google Scholar](https://scholar.google.com/citations?user=SrzMV7sAAAAJ&hl=en) ·
+[Stoneforge Labs](https://github.com/Stoneforge-Labs)
