@@ -23,6 +23,17 @@ GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8899 \
 gemini
 ```
 
+Or run the published container:
+
+```bash
+docker run --rm -p 127.0.0.1:8899:8899 \
+  --add-host host.docker.internal:host-gateway \
+  ghcr.io/stoneforge-labs/gemma-gateway:latest
+```
+
+Production should pin the immutable commit tag or its resolved digest, not
+`latest`.
+
 Without `--model`, the gateway reads vLLM's `/models` endpoint and follows model
 changes. Use `--model NAME` only to pin a fixed upstream.
 
