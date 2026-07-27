@@ -122,6 +122,58 @@ impl Gateway {
             *self.discovered.write().await = None;
         }
     }
+
+    /// POST a translated request upstream, retrying once against a freshly
+    /// discovered model name if the first attempt is rejected.
+    ///
+    /// A rejection here almost always means one thing: vLLM was restarted onto
+    /// a different profile, so the name cached at first contact no longer
+    /// exists. `gem --12b` does exactly that, and without this the gateway kept
+    /// asking for the model that used to be loaded until someone restarted it
+    /// by hand. Rediscovering costs one extra request, once.
+    ///
+    /// Both callers go through here because the streaming path used to skip the
+    /// status check entirely: vLLM answers an unknown model with 404 and a JSON
+    /// body, which contains no `data:` lines, so the SSE loop forwarded nothing
+    /// and returned a perfectly valid EMPTY 200 stream. The CLI reported "the
+    /// model returned an empty response", which points at the model and not at
+    /// the dead name in the request.
+    async fn post_chat(
+        &self,
+        model: &str,
+        body: &Value,
+        stream: bool,
+    ) -> Result<reqwest::Response, (StatusCode, String)> {
+        let url = format!("{}/chat/completions", self.upstream.trim_end_matches('/'));
+        let mut name = model.to_string();
+        for attempt in 0..2 {
+            let payload = translate::request_to_openai(&name, body, stream);
+            tracing::debug!(openai = %payload, "outbound");
+            let resp = self
+                .http
+                .post(&url)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            if resp.status().is_success() {
+                return Ok(resp);
+            }
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            tracing::warn!(%status, %detail, "upstream rejected the request");
+            self.forget_model().await;
+            let fresh = self.resolve_model(&name).await;
+            // Same name back means the rejection was about something other than
+            // a stale name, so retrying would just ask the same question twice.
+            if attempt == 1 || fresh == name {
+                return Err((StatusCode::BAD_GATEWAY, detail));
+            }
+            tracing::info!("retrying as {fresh}");
+            name = fresh;
+        }
+        unreachable!("the loop returns on both attempts")
+    }
 }
 
 /// `POST /v1beta/models/{model}:generateContent`
@@ -161,35 +213,35 @@ async fn model_action(
 
 async fn generate(gw: Arc<Gateway>, model: String, body: Value) -> Response {
     tracing::debug!(gemini = %body, "inbound");
-    let payload = translate::request_to_openai(&model, &body, false);
-    tracing::debug!(openai = %payload, "outbound");
-    let url = format!("{}/chat/completions", gw.upstream.trim_end_matches('/'));
-    match gw.http.post(&url).json(&payload).send().await {
-        Ok(resp) => match resp.json::<Value>().await {
-            Ok(v) => {
-                if v.get("error").is_some() {
-                    tracing::warn!(error = %v, "upstream returned an error");
-                    // Most often "model not found" after a profile switch.
-                    gw.forget_model().await;
-                    return (StatusCode::BAD_GATEWAY, Json(v)).into_response();
-                }
-                Json(translate::response_to_gemini(&v)).into_response()
+    let resp = match gw.post_chat(&model, &body, false).await {
+        Ok(r) => r,
+        Err((status, detail)) => {
+            return (status, Json(json!({"error": {"message": detail}}))).into_response()
+        }
+    };
+    match resp.json::<Value>().await {
+        Ok(v) => {
+            // A 200 carrying an error body: rarer than the 404, but it happens
+            // for a malformed grammar, and it is still worth not translating.
+            if v.get("error").is_some() {
+                tracing::warn!(error = %v, "upstream returned an error");
+                gw.forget_model().await;
+                return (StatusCode::BAD_GATEWAY, Json(v)).into_response();
             }
-            Err(e) => upstream_error("decoding upstream response", e),
-        },
-        Err(e) => upstream_error("calling upstream", e),
+            Json(translate::response_to_gemini(&v)).into_response()
+        }
+        Err(e) => upstream_error("decoding upstream response", e),
     }
 }
 
 async fn stream_generate(gw: Arc<Gateway>, model: String, body: Value, _sse: bool) -> Response {
     tracing::debug!(gemini = %body, "inbound (stream)");
-    let payload = translate::request_to_openai(&model, &body, true);
-    tracing::debug!(openai = %payload, "outbound (stream)");
-    let url = format!("{}/chat/completions", gw.upstream.trim_end_matches('/'));
-
-    let resp = match gw.http.post(&url).json(&payload).send().await {
+    let resp = match gw.post_chat(&model, &body, true).await {
         Ok(r) => r,
-        Err(e) => return upstream_error("opening upstream stream", e),
+        // Report the rejection instead of opening an empty stream over it.
+        Err((status, detail)) => {
+            return (status, Json(json!({"error": {"message": detail}}))).into_response()
+        }
     };
 
     // Re-frame OpenAI SSE as Gemini SSE. Both use `data: <json>` lines, so the
