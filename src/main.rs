@@ -56,6 +56,11 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// How many times to re-ask when the model returns a completely empty turn.
+/// Two extra attempts takes an 8% per-turn failure to 0.08^3, about one in two
+/// thousand -- enough that a long build stops dying of it.
+const EMPTY_TURN_RETRIES: usize = 2;
+
 #[derive(Clone)]
 struct Gateway {
     upstream: String,
@@ -247,38 +252,91 @@ async fn stream_generate(gw: Arc<Gateway>, model: String, body: Value, _sse: boo
     // Re-frame OpenAI SSE as Gemini SSE. Both use `data: <json>` lines, so the
     // work is per-chunk translation, not reframing the protocol. Chunks can
     // split mid-line, so hold a buffer across reads.
+    //
+    // Wrapped in a retry, because this model sometimes says nothing at all.
+    // Measured by replaying one real agent turn 12 times: 11 came back with the
+    // tool call, and 1 came back completely empty -- no text, no tool call,
+    // finish_reason "stop". About 8% of turns.
+    //
+    // That is fatal on the client side and cannot be fixed there. Gemini CLI
+    // classifies an empty turn as NO_RESPONSE_TEXT, and its own retry logic
+    // reads:
+    //     const isRetryableContentError =
+    //         isContentError && error40.type !== "NO_RESPONSE_TEXT";
+    // so of all the content errors, this is precisely the one it will NOT retry.
+    // The whole run dies with "The model returned an empty response or malformed
+    // tool call" -- which blames the tool call, and is why this took so long to
+    // find. At 8% a turn, a 30-turn build survives 0.92^30, about 8% of the
+    // time: short tasks usually finish, long ones almost never.
+    //
+    // Retrying here is free precisely because the turn was empty -- nothing has
+    // been yielded to the client yet, so a second attempt is indistinguishable
+    // from a slower first one. Only a turn that produced NOTHING is retried; the
+    // moment any part is emitted this streams straight through as before.
     let stream = async_stream::stream! {
-        let mut bytes = resp.bytes_stream();
-        let mut buf = String::new();
-        // Tool calls arrive in fragments across chunks; hold them until the
-        // model reports finish, then emit each as one whole functionCall.
-        let mut acc = translate::ToolCallAccumulator::new();
-        while let Some(next) = bytes.next().await {
-            let chunk = match next {
-                Ok(c) => c,
-                Err(e) => { tracing::warn!(error = %e, "stream broke"); break; }
-            };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(idx) = buf.find('\n') {
-                let line = buf[..idx].trim().to_string();
-                buf.drain(..=idx);
-                let Some(data) = line.strip_prefix("data:") else { continue };
-                let data = data.trim();
-                if data.is_empty() { continue }
-                if data == "[DONE]" {
-                    // OpenAI terminates a stream with a literal [DONE] sentinel;
-                    // Google's SSE does not — it just ends. Forwarding it makes
-                    // the GenAI SDK try to JSON.parse the word "[DONE]" and
-                    // crash the turn after the answer already arrived.
-                    return;
-                }
-                let Ok(parsed) = serde_json::from_str::<Value>(data) else {
-                    tracing::debug!(raw = %data, "unparseable chunk, skipped");
-                    continue
+        let mut resp = resp;
+        let mut attempt = 0usize;
+        loop {
+            let mut buf = String::new();
+            // Tool calls arrive in fragments across chunks; hold them until the
+            // model reports finish, then emit each as one whole functionCall.
+            let mut acc = translate::ToolCallAccumulator::new();
+            let mut emitted = 0usize;
+            let mut bytes = resp.bytes_stream();
+            'read: while let Some(next) = bytes.next().await {
+                let chunk = match next {
+                    Ok(c) => c,
+                    Err(e) => { tracing::warn!(error = %e, "stream broke"); break 'read; }
                 };
-                if let Some(out) = translate::chunk_to_gemini_acc(&parsed, &mut acc) {
-                    let framed = format!("data: {out}\n\n");
-                    yield Ok::<_, std::io::Error>(axum::body::Bytes::from(framed));
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(idx) = buf.find('\n') {
+                    let line = buf[..idx].trim().to_string();
+                    buf.drain(..=idx);
+                    let Some(data) = line.strip_prefix("data:") else { continue };
+                    let data = data.trim();
+                    if data.is_empty() { continue }
+                    if data == "[DONE]" {
+                        // OpenAI terminates a stream with a literal [DONE]
+                        // sentinel; Google's SSE does not -- it just ends.
+                        // Forwarding it makes the GenAI SDK try to JSON.parse
+                        // the word "[DONE]" and crash the turn after the answer
+                        // already arrived.
+                        break 'read;
+                    }
+                    let Ok(parsed) = serde_json::from_str::<Value>(data) else {
+                        tracing::debug!(raw = %data, "unparseable chunk, skipped");
+                        continue
+                    };
+                    if let Some(out) = translate::chunk_to_gemini_acc(&parsed, &mut acc) {
+                        // Usage-only trailers carry no content, and a turn that
+                        // is nothing but one of those is exactly the empty turn
+                        // being retried -- so they must not count as output.
+                        if translate::carries_content(&out) {
+                            emitted += 1;
+                        }
+                        let framed = format!("data: {out}\n\n");
+                        yield Ok::<_, std::io::Error>(axum::body::Bytes::from(framed));
+                    }
+                }
+            }
+
+            if emitted > 0 {
+                return;
+            }
+            if attempt >= EMPTY_TURN_RETRIES {
+                tracing::warn!(
+                    "upstream returned an empty turn {} times; giving up",
+                    attempt + 1
+                );
+                return;
+            }
+            attempt += 1;
+            tracing::warn!("upstream returned an empty turn; retrying ({attempt})");
+            match gw.post_chat(&model, &body, true).await {
+                Ok(r) => resp = r,
+                Err((_, detail)) => {
+                    tracing::warn!(%detail, "retry of an empty turn failed");
+                    return;
                 }
             }
         }

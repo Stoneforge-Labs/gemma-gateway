@@ -602,6 +602,42 @@ pub fn chunk_to_gemini(chunk: &Value) -> Option<Value> {
     Some(Value::Object(out))
 }
 
+/// Does this translated chunk carry anything the client will count as output?
+///
+/// Gemini CLI decides a turn was empty by looking for visible text or a function
+/// call; a usage-only trailer and a thought-only part both leave it with
+/// nothing, and it treats that as NO_RESPONSE_TEXT -- the one content error it
+/// refuses to retry. So "did this turn produce output" has to be answered the
+/// same way the client answers it, or the retry either never fires or fires
+/// when it should not.
+pub fn carries_content(chunk: &Value) -> bool {
+    let Some(candidates) = chunk.get("candidates").and_then(Value::as_array) else {
+        return false;
+    };
+    candidates.iter().any(|c| {
+        c.get("content")
+            .and_then(|c| c.get("parts"))
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts.iter().any(|p| {
+                    if p.get("functionCall").is_some() {
+                        return true;
+                    }
+                    // A thought is not an answer: reasoning alone still leaves
+                    // the client with an empty turn.
+                    if p.get("thought").and_then(Value::as_bool).unwrap_or(false) {
+                        return false;
+                    }
+                    p.get("text")
+                        .and_then(Value::as_str)
+                        .map(|t| !t.is_empty())
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,6 +721,37 @@ mod tests {
         assert_eq!(out["candidates"][0]["content"]["parts"][0]["text"], "hello");
         assert_eq!(out["usageMetadata"]["totalTokenCount"], 4);
         assert_eq!(out["candidates"][0]["finishReason"], "STOP");
+    }
+
+    #[test]
+    fn a_usage_only_trailer_is_not_output() {
+        // The chunk that ends every stream. Counting it as output would mean an
+        // empty turn never looks empty, and the retry would never fire.
+        let chunk = json!({"usageMetadata": {"totalTokenCount": 20}});
+        assert!(!carries_content(&chunk));
+    }
+
+    #[test]
+    fn a_thought_only_turn_is_not_output() {
+        // The client counts visible text, not reasoning. A turn that is all
+        // thinking leaves it with nothing, so it has to be retried.
+        let chunk = json!({"candidates": [{"content": {"role": "model",
+            "parts": [{"text": "hmm", "thought": true}]}}]});
+        assert!(!carries_content(&chunk));
+    }
+
+    #[test]
+    fn text_and_function_calls_are_output() {
+        let text = json!({"candidates": [{"content": {"role": "model",
+            "parts": [{"text": "hello"}]}}]});
+        assert!(carries_content(&text));
+        let call = json!({"candidates": [{"content": {"role": "model",
+            "parts": [{"functionCall": {"name": "read_file", "args": {}}}]}}]});
+        assert!(carries_content(&call));
+        // Empty string is not output either.
+        let blank = json!({"candidates": [{"content": {"role": "model",
+            "parts": [{"text": ""}]}}]});
+        assert!(!carries_content(&blank));
     }
 
     #[test]
