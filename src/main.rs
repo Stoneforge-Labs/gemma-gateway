@@ -56,6 +56,11 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// How many times to re-ask when the model returns a completely empty turn.
+/// Two extra attempts takes an 8% per-turn failure to 0.08^3, about one in two
+/// thousand -- enough that a long build stops dying of it.
+const EMPTY_TURN_RETRIES: usize = 2;
+
 #[derive(Clone)]
 struct Gateway {
     upstream: String,
@@ -122,6 +127,68 @@ impl Gateway {
             *self.discovered.write().await = None;
         }
     }
+
+    /// POST a translated request upstream, retrying once against a freshly
+    /// discovered model name if the first attempt is rejected.
+    ///
+    /// A rejection here almost always means one thing: vLLM was restarted onto
+    /// a different profile, so the name cached at first contact no longer
+    /// exists. `gem --12b` does exactly that, and without this the gateway kept
+    /// asking for the model that used to be loaded until someone restarted it
+    /// by hand. Rediscovering costs one extra request, once.
+    ///
+    /// Both callers go through here because the streaming path used to skip the
+    /// status check entirely: vLLM answers an unknown model with 404 and a JSON
+    /// body, which contains no `data:` lines, so the SSE loop forwarded nothing
+    /// and returned a perfectly valid EMPTY 200 stream. The CLI reported "the
+    /// model returned an empty response", which points at the model and not at
+    /// the dead name in the request.
+    async fn post_chat(
+        &self,
+        model: &str,
+        body: &Value,
+        stream: bool,
+    ) -> Result<reqwest::Response, (StatusCode, String)> {
+        let url = format!("{}/chat/completions", self.upstream.trim_end_matches('/'));
+        let mut name = model.to_string();
+        for attempt in 0..2 {
+            let payload = translate::request_to_openai(&name, body, stream);
+            tracing::debug!(openai = %payload, "outbound");
+            let resp = self
+                .http
+                .post(&url)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+            if resp.status().is_success() {
+                return Ok(resp);
+            }
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            tracing::warn!(%status, %detail, "upstream rejected the request");
+            self.forget_model().await;
+            let fresh = self.resolve_model(&name).await;
+            // Same name back means the rejection was about something other than
+            // a stale name, so retrying would just ask the same question twice.
+            if attempt == 1 || fresh == name {
+                // Pass a client error through as a client error. Reporting an
+                // over-long prompt as 502 tells the CLI the server is broken,
+                // so it retried the identical too-large request four times with
+                // backoff and then gave up -- when a 400 says "this request is
+                // wrong", which is both true and something it can act on.
+                let out = if status.is_client_error() {
+                    status
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                return Err((out, detail));
+            }
+            tracing::info!("retrying as {fresh}");
+            name = fresh;
+        }
+        unreachable!("the loop returns on both attempts")
+    }
 }
 
 /// `POST /v1beta/models/{model}:generateContent`
@@ -161,23 +228,24 @@ async fn model_action(
 
 async fn generate(gw: Arc<Gateway>, model: String, body: Value) -> Response {
     tracing::debug!(gemini = %body, "inbound");
-    let payload = translate::request_to_openai(&model, &body, false);
-    tracing::debug!(openai = %payload, "outbound");
-    let url = format!("{}/chat/completions", gw.upstream.trim_end_matches('/'));
-    match gw.http.post(&url).json(&payload).send().await {
-        Ok(resp) => match resp.json::<Value>().await {
-            Ok(v) => {
-                if v.get("error").is_some() {
-                    tracing::warn!(error = %v, "upstream returned an error");
-                    // Most often "model not found" after a profile switch.
-                    gw.forget_model().await;
-                    return (StatusCode::BAD_GATEWAY, Json(v)).into_response();
-                }
-                Json(translate::response_to_gemini(&v)).into_response()
+    let resp = match gw.post_chat(&model, &body, false).await {
+        Ok(r) => r,
+        Err((status, detail)) => {
+            return (status, Json(json!({"error": {"message": detail}}))).into_response()
+        }
+    };
+    match resp.json::<Value>().await {
+        Ok(v) => {
+            // A 200 carrying an error body: rarer than the 404, but it happens
+            // for a malformed grammar, and it is still worth not translating.
+            if v.get("error").is_some() {
+                tracing::warn!(error = %v, "upstream returned an error");
+                gw.forget_model().await;
+                return (StatusCode::BAD_GATEWAY, Json(v)).into_response();
             }
-            Err(e) => upstream_error("decoding upstream response", e),
-        },
-        Err(e) => upstream_error("calling upstream", e),
+            Json(translate::response_to_gemini(&v)).into_response()
+        }
+        Err(e) => upstream_error("decoding upstream response", e),
     }
 }
 
@@ -213,50 +281,102 @@ async fn openai_chat(State(gw): State<Arc<Gateway>>, Json(mut body): Json<Value>
 
 async fn stream_generate(gw: Arc<Gateway>, model: String, body: Value, _sse: bool) -> Response {
     tracing::debug!(gemini = %body, "inbound (stream)");
-    let payload = translate::request_to_openai(&model, &body, true);
-    tracing::debug!(openai = %payload, "outbound (stream)");
-    let url = format!("{}/chat/completions", gw.upstream.trim_end_matches('/'));
-
-    let resp = match gw.http.post(&url).json(&payload).send().await {
+    let resp = match gw.post_chat(&model, &body, true).await {
         Ok(r) => r,
-        Err(e) => return upstream_error("opening upstream stream", e),
+        // Report the rejection instead of opening an empty stream over it.
+        Err((status, detail)) => {
+            return (status, Json(json!({"error": {"message": detail}}))).into_response()
+        }
     };
 
     // Re-frame OpenAI SSE as Gemini SSE. Both use `data: <json>` lines, so the
     // work is per-chunk translation, not reframing the protocol. Chunks can
     // split mid-line, so hold a buffer across reads.
+    //
+    // Wrapped in a retry, because this model sometimes says nothing at all.
+    // Measured by replaying one real agent turn 12 times: 11 came back with the
+    // tool call, and 1 came back completely empty -- no text, no tool call,
+    // finish_reason "stop". About 8% of turns.
+    //
+    // That is fatal on the client side and cannot be fixed there. Gemini CLI
+    // classifies an empty turn as NO_RESPONSE_TEXT, and its own retry logic
+    // reads:
+    //     const isRetryableContentError =
+    //         isContentError && error40.type !== "NO_RESPONSE_TEXT";
+    // so of all the content errors, this is precisely the one it will NOT retry.
+    // The whole run dies with "The model returned an empty response or malformed
+    // tool call" -- which blames the tool call, and is why this took so long to
+    // find. At 8% a turn, a 30-turn build survives 0.92^30, about 8% of the
+    // time: short tasks usually finish, long ones almost never.
+    //
+    // Retrying here is free precisely because the turn was empty -- nothing has
+    // been yielded to the client yet, so a second attempt is indistinguishable
+    // from a slower first one. Only a turn that produced NOTHING is retried; the
+    // moment any part is emitted this streams straight through as before.
     let stream = async_stream::stream! {
-        let mut bytes = resp.bytes_stream();
-        let mut buf = String::new();
-        // Tool calls arrive in fragments across chunks; hold them until the
-        // model reports finish, then emit each as one whole functionCall.
-        let mut acc = translate::ToolCallAccumulator::new();
-        while let Some(next) = bytes.next().await {
-            let chunk = match next {
-                Ok(c) => c,
-                Err(e) => { tracing::warn!(error = %e, "stream broke"); break; }
-            };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(idx) = buf.find('\n') {
-                let line = buf[..idx].trim().to_string();
-                buf.drain(..=idx);
-                let Some(data) = line.strip_prefix("data:") else { continue };
-                let data = data.trim();
-                if data.is_empty() { continue }
-                if data == "[DONE]" {
-                    // OpenAI terminates a stream with a literal [DONE] sentinel;
-                    // Google's SSE does not — it just ends. Forwarding it makes
-                    // the GenAI SDK try to JSON.parse the word "[DONE]" and
-                    // crash the turn after the answer already arrived.
-                    return;
-                }
-                let Ok(parsed) = serde_json::from_str::<Value>(data) else {
-                    tracing::debug!(raw = %data, "unparseable chunk, skipped");
-                    continue
+        let mut resp = resp;
+        let mut attempt = 0usize;
+        loop {
+            let mut buf = String::new();
+            // Tool calls arrive in fragments across chunks; hold them until the
+            // model reports finish, then emit each as one whole functionCall.
+            let mut acc = translate::ToolCallAccumulator::new();
+            let mut emitted = 0usize;
+            let mut bytes = resp.bytes_stream();
+            'read: while let Some(next) = bytes.next().await {
+                let chunk = match next {
+                    Ok(c) => c,
+                    Err(e) => { tracing::warn!(error = %e, "stream broke"); break 'read; }
                 };
-                if let Some(out) = translate::chunk_to_gemini_acc(&parsed, &mut acc) {
-                    let framed = format!("data: {out}\n\n");
-                    yield Ok::<_, std::io::Error>(axum::body::Bytes::from(framed));
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(idx) = buf.find('\n') {
+                    let line = buf[..idx].trim().to_string();
+                    buf.drain(..=idx);
+                    let Some(data) = line.strip_prefix("data:") else { continue };
+                    let data = data.trim();
+                    if data.is_empty() { continue }
+                    if data == "[DONE]" {
+                        // OpenAI terminates a stream with a literal [DONE]
+                        // sentinel; Google's SSE does not -- it just ends.
+                        // Forwarding it makes the GenAI SDK try to JSON.parse
+                        // the word "[DONE]" and crash the turn after the answer
+                        // already arrived.
+                        break 'read;
+                    }
+                    let Ok(parsed) = serde_json::from_str::<Value>(data) else {
+                        tracing::debug!(raw = %data, "unparseable chunk, skipped");
+                        continue
+                    };
+                    if let Some(out) = translate::chunk_to_gemini_acc(&parsed, &mut acc) {
+                        // Usage-only trailers carry no content, and a turn that
+                        // is nothing but one of those is exactly the empty turn
+                        // being retried -- so they must not count as output.
+                        if translate::carries_content(&out) {
+                            emitted += 1;
+                        }
+                        let framed = format!("data: {out}\n\n");
+                        yield Ok::<_, std::io::Error>(axum::body::Bytes::from(framed));
+                    }
+                }
+            }
+
+            if emitted > 0 {
+                return;
+            }
+            if attempt >= EMPTY_TURN_RETRIES {
+                tracing::warn!(
+                    "upstream returned an empty turn {} times; giving up",
+                    attempt + 1
+                );
+                return;
+            }
+            attempt += 1;
+            tracing::warn!("upstream returned an empty turn; retrying ({attempt})");
+            match gw.post_chat(&model, &body, true).await {
+                Ok(r) => resp = r,
+                Err((_, detail)) => {
+                    tracing::warn!(%detail, "retry of an empty turn failed");
+                    return;
                 }
             }
         }
@@ -319,16 +439,46 @@ async fn list_models(State(gw): State<Arc<Gateway>>) -> Response {
             Vec::new()
         }
     };
-    let models: Vec<Value> = ids
-        .iter()
-        .map(|id| {
-            json!({
-                "name": format!("models/{id}"),
-                "displayName": id,
-                "supportedGenerationMethods": ["generateContent", "streamGenerateContent", "countTokens"],
-            })
+    // Advertise the stock Gemini names alongside whatever is really loaded.
+    //
+    // The CLI's "auto" model mode does not send your turn straight to the
+    // model. It first asks a small router model -- gemini-3.1-flash-lite --
+    // which one should handle it. That name is not what vLLM is serving, so it
+    // was missing from this list, and the CLI gave up before it ever sent the
+    // request: four router calls billed at zero tokens, nothing in this
+    // gateway's log at all, and a session that just sat there. The turn had not
+    // failed, it had never started.
+    //
+    // Nothing is being faked that is not already true: resolve_model() rewrites
+    // whatever name a request carries to the model actually loaded, so a call
+    // for any of these is answered by the local Gemma. Impersonating the Gemini
+    // API is this program's entire job -- listing only one name was the
+    // inconsistency, not this.
+    const ALIASES: &[&str] = &[
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-flash",
+        "gemini-3.1-pro",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+    ];
+    let entry = |id: &str| {
+        json!({
+            "name": format!("models/{id}"),
+            "displayName": id,
+            "supportedGenerationMethods": ["generateContent", "streamGenerateContent", "countTokens"],
         })
-        .collect();
+    };
+    // Real ones first: `gem` reads models[0] to decide what to pass as -m, so a
+    // stock name at the front would pin the session to an alias and make every
+    // log say "gemini-3.1-pro" for a Gemma.
+    let mut models: Vec<Value> = ids.iter().map(|id| entry(id)).collect();
+    models.extend(
+        ALIASES
+            .iter()
+            .filter(|a| !ids.iter().any(|id| id == *a))
+            .map(|a| entry(a)),
+    );
     Json(json!({"models": models})).into_response()
 }
 

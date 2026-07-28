@@ -68,6 +68,22 @@ The gateway implements `generateContent`, `streamGenerateContent`, `countTokens`
 and model listing on both `/v1` and `/v1beta`. OpenAI-compatible clients can
 share the same ingress through `/v1/chat/completions`.
 
+## Gemini CLI reliability behavior
+
+- Gemini CLI's `auto` mode asks stock Gemini router model names first. The
+  gateway advertises those aliases but resolves every request to the model
+  actually loaded in vLLM.
+- A rejected request clears the discovered-model cache and retries once after
+  rediscovery, so switching vLLM profiles does not require restarting the
+  gateway.
+- A streamed turn that produces no visible text or tool call is retried at most
+  twice, but only before anything has been sent to the client.
+- Upstream 4xx responses remain 4xx; transport and upstream server failures are
+  reported as gateway failures.
+
+`/health` proves that the gateway process is alive. Use `/v1/models` to prove
+that the upstream model is ready.
+
 ## Why this shape
 
 `GOOGLE_GEMINI_BASE_URL` redirects Gemini CLI's inference requests to the local
