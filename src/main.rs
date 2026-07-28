@@ -172,7 +172,17 @@ impl Gateway {
             // Same name back means the rejection was about something other than
             // a stale name, so retrying would just ask the same question twice.
             if attempt == 1 || fresh == name {
-                return Err((StatusCode::BAD_GATEWAY, detail));
+                // Pass a client error through as a client error. Reporting an
+                // over-long prompt as 502 tells the CLI the server is broken,
+                // so it retried the identical too-large request four times with
+                // backoff and then gave up -- when a 400 says "this request is
+                // wrong", which is both true and something it can act on.
+                let out = if status.is_client_error() {
+                    status
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                return Err((out, detail));
             }
             tracing::info!("retrying as {fresh}");
             name = fresh;
