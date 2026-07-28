@@ -99,12 +99,11 @@ fn media_part(part: &Value) -> Option<Value> {
             .unwrap_or("application/octet-stream");
         let data = inline.get("data").and_then(Value::as_str)?;
         (mime.to_string(), format!("data:{mime};base64,{data}"))
-    } else if let Some(file) = part.get("fileData") {
+    } else {
+        let file = part.get("fileData")?;
         let mime = file.get("mimeType").and_then(Value::as_str).unwrap_or("");
         let uri = file.get("fileUri").and_then(Value::as_str)?;
         (mime.to_string(), uri.to_string())
-    } else {
-        return None;
     };
 
     Some(if mime.starts_with("audio/") {
